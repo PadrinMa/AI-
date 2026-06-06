@@ -1,0 +1,26 @@
+{
+  "allergies": [
+    "peanut",
+    "peanut butter",
+    "shellfish",
+    "shrimp",
+    "crab",
+    "lobster",
+    "hazelnut",
+    "walnut"
+  ],
+  "dislikes": [
+    "anchovy",
+    "sardine",
+    "blue cheese",
+    "goat cheese",
+    "liver",
+    "beet",
+    "cilantro",
+    "fennel",
+    "okra",
+    "raisin",
+    "mint",
+    "very spicy food"
+  ]
+}
