@@ -1,0 +1,343 @@
+"""
+import torch
+from PIL import Image, ImageDraw, ImageFont
+import os
+import time
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+
+def get_class_id(label, fallback_class):
+    # Each ingredient gets a unique class ID, built automatically from the ordered list
+    all_labels = [\
+        # Meat
+        "beef", "beef rib", "beef shank", "beef tenderloin", "brisket", "ground beef",
+        "ground lamb", "lamb", "lamb chop", "lamb shank", "rack of lamb", "veal", "venison",
+        "pork", "pork chop", "pork rib", "pork tenderloin", "prosciutto", "ham", "bacon",
+        "sausage", "meatball", "steak",
+        # Poultry
+        "duck", "chicken", "goose", "quail", "rabbit", "turkey",
+        # Fish & Seafood
+        "anchovy", "bass", "cod", "halibut", "salmon", "sardine", "snapper", "swordfish",
+        "tilapia", "trout", "tuna", "clam", "crab", "lobster", "mussel", "octopus",
+        "oyster", "scallop", "shrimp", "squid",
+        # Dairy & Eggs
+        "egg", "butter", "buttermilk", "milk", "cream", "sour cream", "yogurt",
+        "cottage cheese", "cream cheese", "ricotta", "marscarpone", "brie", "blue cheese",
+        "cheddar", "feta", "fontina", "goat cheese", "gouda", "mozzarella", "parmesan",
+        "swiss cheese",
+        # Vegetables
+        "artichoke", "arugula", "asparagus", "avocado", "beet", "bell pepper", "bok choy",
+        "broccoli", "broccoli rabe", "brussel sprout", "butternut squash", "cabbage",
+        "carrot", "cauliflower", "celery", "chard", "collard greens", "corn", "cucumber",
+        "eggplant", "endive", "escarole", "fennel", "garlic", "green bean", "green onion",
+        "scallion", "jerusalem artichoke", "kale", "leek", "lettuce", "mushroom",
+        "mustard greens", "okra", "onion", "parsnip", "pea", "poblano", "potato",
+        "pumpkin", "radicchio", "radish", "spinach", "squash", "sweet potato", "yam",
+        "tomatillo", "tomato", "turnip", "watercress", "yellow squash", "zucchini",
+        "yuca", "jicama", "sugar snap pea", "lima bean", "hominy", "plantain",
+        # Fruits
+        "apple", "apricot", "banana", "blackberry", "blueberry", "cantaloupe", "cherry",
+        "cranberry", "currant", "date", "fig", "grape", "grapefruit", "guava", "honeydew",
+        "kiwi", "kumquat", "lemon", "lime", "lychee", "mango", "melon", "nectarine",
+        "orange", "papaya", "passion fruit", "peach", "pear", "persimmon", "pineapple",
+        "plum", "pomegranate", "quince", "raspberry", "rhubarb", "strawberry", "tangerine",
+        "watermelon", "asian pear", "lingonberry",
+        # Grains, Legumes & Starches
+        "barley", "bean", "bran", "brown rice", "bulgur", "chickpea", "cornmeal",
+        "couscous", "lentil", "oat", "orzo", "pasta", "quinoa", "rice", "semolina",
+        "sourdough", "wheat", "wild rice", "noodle", "breadcrumbs", "tortillas",
+        "phyllo", "puff pastry",
+        # Nuts & Seeds
+        "almond", "cashew", "chestnut", "hazelnut", "macadamia nut", "peanut", "pecan",
+        "pine nut", "pistachio", "poppy", "sesame", "walnut",
+        # Herbs & Spices
+        "anise", "basil", "caraway", "cardamom", "chive", "cilantro", "cinnamon", "clove",
+        "coriander", "cumin", "dill", "ginger", "horseradish", "mint", "mustard", "nutmeg",
+        "oregano", "paprika", "parsley", "rosemary", "saffron", "sage", "tarragon", "thyme",
+        "wasabi", "jalapeno", "chile", "chile pepper",
+        # Condiments
+        "capers", "honey", "maple syrup", "mayonnaise", "molasses", "olive", "peanut butter",
+        "sesame oil", "soy sauce", "tamarind", "vinegar",
+        # Other
+        "chocolate", "coconut", "coffee", "marshmallow", "vanilla", "butterscotch",
+        "caramel", "tapioca", "caviar", "tofu", "miso",
+        # Beverages
+        "beer", "bourbon", "brandy", "calvados", "campari", "champagne", "chartreuse",
+        "cognac", "armagnac", "eau de vie", "frangelico", "gin", "grappa", "kahlua",
+        "kirsch", "liqueur", "marsala", "mezcal", "port", "rum", "sake", "scotch",
+        "sherry", "sparkling wine", "spirit", "tequila", "triple sec", "vermouth", "vodka",
+        "whiskey", "white wine", "red wine", "rose wine", "amaretto", "midori",
+        "apple juice", "cranberry juice", "grapefruit juice", "lemon juice", "lime juice",
+        "orange juice", "pomegranate juice", "tea", "iced tea", "iced coffee",
+    ]
+    # Build the map automatically: each label gets its index as class ID
+    label_map = {name: idx for idx, name in enumerate(all_labels)}
+    return label_map.get(label.lower(), fallback_class)
+
+
+def area_overlap_filter(boxes, scores, threshold=0.8):
+    # Keeps the highest-scoring box when two boxes overlap more than the threshold.
+    # This avoids duplicate detections on the same ingredient.
+    keep = []
+    suppressed = torch.zeros(len(scores), dtype=torch.bool, device=boxes.device)
+    sorted_indices = scores.argsort(descending=True)
+    for i in sorted_indices:
+        if suppressed[i]:
+            continue
+        keep.append(i.item())
+        box_i = boxes[i]
+        for j in sorted_indices:
+            if i == j or suppressed[j]:
+                continue
+            box_j = boxes[j]
+            x1 = max(box_i[0], box_j[0])
+            y1 = max(box_i[1], box_j[1])
+            x2 = min(box_i[2], box_j[2])
+            y2 = min(box_i[3], box_j[3])
+            inter_w = max(0, x2 - x1)
+            inter_h = max(0, y2 - y1)
+            inter_area = inter_w * inter_h
+            if inter_area == 0:
+                continue
+            area_i = (box_i[2] - box_i[0]) * (box_i[3] - box_i[1])
+            area_j = (box_j[2] - box_j[0]) * (box_j[3] - box_j[1])
+            smaller_area = min(area_i, area_j)
+            if inter_area / smaller_area >= threshold:
+                suppressed[j] = True
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+
+def convert_to_yolo(box, image_w, image_h):
+    # Converts absolute pixel coordinates [x1,y1,x2,y2] to YOLO format
+    # [x_center, y_center, width, height] normalized in [0,1]
+    x1, y1, x2, y2 = box
+    xc = (x1 + x2) / 2 / image_w
+    yc = (y1 + y2) / 2 / image_h
+    w  = (x2 - x1) / image_w
+    h  = (y2 - y1) / image_h
+    return f"{xc:.6f} {yc:.6f} {w:.6f} {h:.6f}"
+
+
+def draw_detection(draw, box, label_text, idx, font):
+    # Draws a bounding box and label on the image for visual inspection
+    x1, y1, x2, y2 = box
+    draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0, 255), width=4)
+    bbox    = font.getbbox(label_text)
+    text_w  = bbox[2] - bbox[0]
+    text_h  = bbox[3] - bbox[1]
+    padding = 2
+    draw.rectangle(
+        [x1 + 2 - padding, y1 + 2 - padding,
+         x1 + 2 + text_w + padding, y1 + 2 + text_h + padding],
+        fill=(255, 0, 0, 200)
+    )
+    draw.text((x1 + 2, y1 + 2), label_text, fill="white", font=font)
+    idx_text = str(idx)
+    bbox     = font.getbbox(idx_text)
+    draw.text((x2 - bbox[2] - 2, y2 - bbox[3] - 2), idx_text, fill="white", font=font)
+
+
+def save_dino_score(score, image_file, output_score_path):
+    os.makedirs(os.path.dirname(output_score_path), exist_ok=True)
+    with open(output_score_path, "a") as f:
+        f.write(str(os.path.basename(image_file)) + " " + str(score) + "\n")
+
+
+def run_dino_batched(image, model, processor, device, text_labels,
+                     confidence_threshold, text_confidence_threshold,
+                     batch_size=20):
+    # Grounding DINO has a 256 token limit on the text input.
+    # We split the label list into batches and merge the results afterwards.
+    all_boxes  = []
+    all_scores = []
+    all_labels = []
+
+    for i in range(0, len(text_labels), batch_size):
+        batch       = text_labels[i:i + batch_size]
+        text_prompt = " . ".join(batch) + " ."
+
+        inputs = processor(
+            images=image,
+            text=text_prompt,
+            return_tensors="pt"
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=confidence_threshold,
+            text_threshold=text_confidence_threshold,
+            target_sizes=[image.size[::-1]],
+        )[0]
+
+        if len(results["boxes"]) > 0:
+            all_boxes.append(results["boxes"])
+            all_scores.append(results["scores"])
+            all_labels.extend(results["text_labels"])
+
+    if all_boxes:
+        return {
+            "boxes":  torch.cat(all_boxes,  dim=0),
+            "scores": torch.cat(all_scores, dim=0),
+            "labels": all_labels
+        }
+    else:
+        return {
+            "boxes":  torch.zeros((0, 4)),
+            "scores": torch.zeros(0),
+            "labels": []
+        }
+
+
+
+
+start_time = time.time()
+model_id   = "IDEA-Research/grounding-dino-base"
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+print(f"Usando il dispositivo: {device}")
+
+input_image_folder  = base + "/images/input"
+output_label_folder = base + "/images/output/labels"
+output_viz_folder   = base + "/images/output/images"
+save_visualization  = True
+output_score_path   = base + "/scores/dino_scores.txt"
+
+confidence_threshold      = 0.3
+text_confidence_threshold = 0.3
+area_overlap_threshold    = 0.85
+fallback_label            = -1  # -1 means the label was not found in the map
+
+# Full ingredient label set, split into batches at inference time
+text_labels = list(set([
+    # Meat
+    "beef", "beef rib", "beef shank", "beef tenderloin", "brisket", "ground beef",
+    "ground lamb", "lamb", "lamb chop", "lamb shank", "rack of lamb", "veal", "venison",
+    "pork", "pork chop", "pork rib", "pork tenderloin", "prosciutto", "ham", "bacon",
+    "sausage", "meatball", "steak",
+    # Poultry
+    "duck", "chicken", "goose", "quail", "rabbit", "turkey",
+    # Fish & Seafood
+    "anchovy", "bass", "cod", "halibut", "salmon", "sardine", "snapper", "swordfish",
+    "tilapia", "trout", "tuna", "clam", "crab", "lobster", "mussel", "octopus",
+    "oyster", "scallop", "shrimp", "squid",
+    # Dairy & Eggs
+    "egg", "butter", "buttermilk", "milk", "cream", "sour cream", "yogurt",
+    "cottage cheese", "cream cheese", "ricotta", "marscarpone", "brie", "blue cheese",
+    "cheddar", "feta", "fontina", "goat cheese", "gouda", "mozzarella", "parmesan",
+    "swiss cheese",
+    # Vegetables
+    "artichoke", "arugula", "asparagus", "avocado", "beet", "bell pepper", "bok choy",
+    "broccoli", "broccoli rabe", "brussel sprout", "butternut squash", "cabbage",
+    "carrot", "cauliflower", "celery", "chard", "collard greens", "corn", "cucumber",
+    "eggplant", "endive", "escarole", "fennel", "garlic", "green bean", "green onion",
+    "scallion", "jerusalem artichoke", "kale", "leek", "lettuce", "mushroom",
+    "mustard greens", "okra", "onion", "parsnip", "pea", "poblano", "potato",
+    "pumpkin", "radicchio", "radish", "spinach", "squash", "sweet potato", "yam",
+    "tomatillo", "tomato", "turnip", "watercress", "yellow squash", "zucchini",
+    "yuca", "jicama", "sugar snap pea", "lima bean", "hominy", "plantain",
+    # Fruits
+    "apple", "apricot", "banana", "blackberry", "blueberry", "cantaloupe", "cherry",
+    "cranberry", "currant", "date", "fig", "grape", "grapefruit", "guava", "honeydew",
+    "kiwi", "kumquat", "lemon", "lime", "lychee", "mango", "melon", "nectarine",
+    "orange", "papaya", "passion fruit", "peach", "pear", "persimmon", "pineapple",
+    "plum", "pomegranate", "quince", "raspberry", "rhubarb", "strawberry", "tangerine",
+    "watermelon", "asian pear", "lingonberry",
+    # Grains, Legumes & Starches
+    "barley", "bean", "bran", "brown rice", "bulgur", "chickpea", "cornmeal",
+    "couscous", "lentil", "oat", "orzo", "pasta", "quinoa", "rice", "semolina",
+    "sourdough", "wheat", "wild rice", "noodle", "breadcrumbs", "tortillas",
+    "phyllo", "puff pastry",
+    # Nuts & Seeds
+    "almond", "cashew", "chestnut", "hazelnut", "macadamia nut", "peanut", "pecan",
+    "pine nut", "pistachio", "poppy", "sesame", "walnut",
+    # Herbs & Spices
+    "anise", "basil", "caraway", "cardamom", "chive", "cilantro", "cinnamon", "clove",
+    "coriander", "cumin", "dill", "ginger", "horseradish", "mint", "mustard", "nutmeg",
+    "oregano", "paprika", "parsley", "rosemary", "saffron", "sage", "tarragon", "thyme",
+    "wasabi", "jalapeno", "chile", "chile pepper",
+    # Condiments
+    "capers", "honey", "maple syrup", "mayonnaise", "molasses", "olive", "peanut butter",
+    "sesame oil", "soy sauce", "tamarind", "vinegar",
+    # Other
+    "chocolate", "coconut", "coffee", "marshmallow", "vanilla", "butterscotch",
+    "caramel", "tapioca", "caviar", "tofu", "miso",
+    # Beverages
+    "beer", "bourbon", "brandy", "calvados", "campari", "champagne", "chartreuse",
+    "cognac", "armagnac", "eau de vie", "frangelico", "gin", "grappa", "kahlua",
+    "kirsch", "liqueur", "marsala", "mezcal", "port", "rum", "sake", "scotch",
+    "sherry", "sparkling wine", "spirit", "tequila", "triple sec", "vermouth", "vodka",
+    "whiskey", "white wine", "red wine", "rose wine", "amaretto", "midori",
+    "apple juice", "cranberry juice", "grapefruit juice", "lemon juice", "lime juice",
+    "orange juice", "pomegranate juice", "tea", "iced tea", "iced coffee",
+]))
+
+os.makedirs(output_label_folder, exist_ok=True)
+os.makedirs(os.path.dirname(output_score_path), exist_ok=True)
+if save_visualization:
+    os.makedirs(output_viz_folder, exist_ok=True)
+
+processor = AutoProcessor.from_pretrained(model_id)
+model     = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+
+image_files = [f for f in os.listdir(input_image_folder)
+               if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+
+# MAIN
+for i, filename in enumerate(sorted(image_files)):
+    image_path    = os.path.join(input_image_folder, filename)
+    image         = Image.open(image_path).convert("RGB")
+    width, height = image.size
+
+    # Run inference in batches to respect the 256 token limit
+    results = run_dino_batched(
+        image, model, processor, device, text_labels,
+        confidence_threshold, text_confidence_threshold,
+        batch_size=20
+    )
+
+    boxes  = results["boxes"]
+    scores = results["scores"]
+    labels = results["labels"]
+
+    # Remove overlapping boxes, keeping the one with the highest confidence
+    if len(boxes) > 0:
+        keep   = area_overlap_filter(boxes, scores, area_overlap_threshold)
+        boxes  = boxes[keep]
+        scores = scores[keep]
+        labels = [labels[k] for k in keep]
+
+    yolo_lines = []
+    draw = ImageDraw.Draw(image, "RGBA") if save_visualization else None
+    font = ImageFont.load_default()      if save_visualization else None
+
+    for idx, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+        cls = get_class_id(label, fallback_class=fallback_label)
+        yolo_lines.append(f"{cls} {convert_to_yolo(box.tolist(), width, height)}")
+        if save_visualization:
+            draw_detection(draw, box.tolist(), f"{label} [{cls}]: ({score:.2f})", idx, font)
+
+    base_name  = os.path.splitext(filename)[0]
+    label_path = os.path.join(output_label_folder, f"{base_name}.txt")
+
+    with open(label_path, "w") as f:
+        f.write("\n".join(yolo_lines))
+
+    if save_visualization:
+        image.save(os.path.join(output_viz_folder, f"{base_name}.jpg"))
+
+    print(f"[{i+1}/{len(image_files)}] Saved {len(yolo_lines)} boxes -> {label_path}")
+    print(f"Time elapsed: {time.time() - start_time:.1f}s")
+
+    save_dino_score(scores, image_path, output_score_path)
+"""
+
